@@ -1,44 +1,50 @@
-"""
-JalNetra -- Async Data Ingestion Service
+"""Async data ingestion from Indian government data sources.
 
-Fetches and normalizes real-world water, weather, and groundwater data
-from Indian government APIs for fusion with local sensor readings:
+Fetches and normalizes water quality, groundwater, weather, and general
+datasets from the following authoritative Indian sources:
 
-  - CPCB (Central Pollution Control Board) -- real-time water quality
-  - India-WRIS (Water Resources Information System) -- groundwater levels
-  - IMD (India Meteorological Department) -- weather: temp, rainfall, humidity
-  - data.gov.in -- open government datasets (CSV, JSON, XML)
+  - CPCB (Central Pollution Control Board) -- Real-time water quality monitoring
+    https://cpcb.nic.in
+  - India-WRIS (Water Resources Information System) -- Groundwater level data
+    https://indiawris.gov.in
+  - IMD (India Meteorological Department) -- Weather observations and forecasts
+    https://mausam.imd.gov.in
+  - data.gov.in -- Open Government Data Platform India
+    https://data.gov.in
 
 All requests are fully async via httpx with:
   - Per-source TTL caching to respect rate limits
   - Automatic fallback to cached data when offline
   - Data normalization into a unified schema
   - Response format parsing: JSON, CSV, XML
+  - Rate limiting to be a respectful API consumer
 """
 
 from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
-import json
-import logging
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+import structlog
 
-logger = logging.getLogger("jalnetra.data_ingestion")
+from edge.config import settings
+
+logger = structlog.get_logger("jalnetra.data_ingestion")
 
 
 # ---------------------------------------------------------------------------
 # Cache entry
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class CacheEntry:
     """TTL-based cache entry for API responses."""
 
@@ -162,9 +168,61 @@ def _safe_float(value: Any, default: float | None = None) -> float | None:
     if value is None or value == "" or value == "NA" or value == "-":
         return default
     try:
-        return float(value)
+        result = float(value)
+        # Filter out NaN and Inf
+        if result != result or result == float("inf") or result == float("-inf"):
+            return default
+        return result
     except (ValueError, TypeError):
         return default
+
+
+# ---------------------------------------------------------------------------
+# API source configuration
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class _SourceConfig:
+    """Configuration for a single data source."""
+
+    name: str
+    base_url: str
+    default_ttl_sec: float = 1800.0  # 30 minutes
+    rate_limit_interval_sec: float = 10.0  # min seconds between requests
+    timeout_sec: float = 30.0
+
+
+_CPCB_CONFIG = _SourceConfig(
+    name="CPCB",
+    base_url="https://app.cpcbccr.com/caaqms",
+    default_ttl_sec=3600.0,  # 1 hour
+    rate_limit_interval_sec=15.0,
+    timeout_sec=45.0,
+)
+
+_INDIA_WRIS_CONFIG = _SourceConfig(
+    name="India-WRIS",
+    base_url="https://indiawris.gov.in/wris",
+    default_ttl_sec=21600.0,  # 6 hours -- groundwater changes slowly
+    rate_limit_interval_sec=10.0,
+    timeout_sec=45.0,
+)
+
+_IMD_CONFIG = _SourceConfig(
+    name="IMD",
+    base_url="https://mausam.imd.gov.in/backend",
+    default_ttl_sec=1800.0,  # 30 minutes
+    rate_limit_interval_sec=10.0,
+    timeout_sec=30.0,
+)
+
+_DATA_GOV_IN_CONFIG = _SourceConfig(
+    name="data.gov.in",
+    base_url="https://api.data.gov.in/resource",
+    default_ttl_sec=43200.0,  # 12 hours -- mostly static datasets
+    rate_limit_interval_sec=5.0,
+    timeout_sec=30.0,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -174,52 +232,63 @@ def _safe_float(value: Any, default: float | None = None) -> float | None:
 class AsyncDataIngestion:
     """Fetches and normalizes external data from Indian government APIs.
 
+    Provides a unified interface for fetching water quality, groundwater,
+    weather, and general datasets with built-in caching, offline fallback,
+    and rate limiting.
+
     Usage::
 
-        ingestion = AsyncDataIngestion(
-            data_gov_api_key="your-key",
-        )
+        ingestion = AsyncDataIngestion(data_gov_api_key="your-key")
         await ingestion.start()
 
-        water_data = await ingestion.fetch_cpcb_water_quality(state="Maharashtra")
+        water = await ingestion.fetch_cpcb_data(state="Maharashtra")
+        gw = await ingestion.fetch_india_wris_data(state="Maharashtra")
         weather = await ingestion.fetch_imd_weather(state="Maharashtra")
-        groundwater = await ingestion.fetch_india_wris_groundwater(state="Maharashtra")
-        datasets = await ingestion.fetch_data_gov(resource_id="abc123")
+        datasets = await ingestion.fetch_data_gov_in(resource_id="abc123")
 
         await ingestion.stop()
     """
 
-    # Default TTLs (seconds)
-    CACHE_TTL_CPCB: float = 3600.0       # 1 hour
-    CACHE_TTL_WRIS: float = 21600.0      # 6 hours
-    CACHE_TTL_IMD: float = 1800.0        # 30 minutes
-    CACHE_TTL_DATA_GOV: float = 43200.0  # 12 hours
-
     HTTP_TIMEOUT_SEC: float = 45.0
     HTTP_MAX_RETRIES: int = 3
+    RETRY_BASE_SEC: float = 2.0
 
     def __init__(
         self,
         *,
         data_gov_api_key: str = "",
-        cpcb_base_url: str = "https://app.cpcbccr.com/caaqms",
-        wris_base_url: str = "https://indiawris.gov.in/wris",
-        imd_base_url: str = "https://mausam.imd.gov.in/backend",
-        data_gov_base_url: str = "https://api.data.gov.in/resource",
+        cpcb_base_url: str | None = None,
+        wris_base_url: str | None = None,
+        imd_base_url: str | None = None,
+        data_gov_base_url: str | None = None,
+        user_agent: str = "JalNetra-EdgeGateway/1.0 (water-quality-monitoring)",
     ) -> None:
         self._data_gov_key = data_gov_api_key
-        self._cpcb_url = cpcb_base_url
-        self._wris_url = wris_base_url
-        self._imd_url = imd_base_url
-        self._data_gov_url = data_gov_base_url
+        self._user_agent = user_agent
 
+        # Allow per-instance URL overrides
+        self._cpcb_url = cpcb_base_url or _CPCB_CONFIG.base_url
+        self._wris_url = wris_base_url or _INDIA_WRIS_CONFIG.base_url
+        self._imd_url = imd_base_url or _IMD_CONFIG.base_url
+        self._data_gov_url = data_gov_base_url or _DATA_GOV_IN_CONFIG.base_url
+
+        # Response cache keyed by request hash
         self._cache: dict[str, CacheEntry] = {}
+        self._cache_lock = asyncio.Lock()
+
+        # Rate limit tracking: source_name -> last_request_time
+        self._last_request_at: dict[str, float] = {}
+
+        # Runtime
         self._http_client: httpx.AsyncClient | None = None
         self._running = False
 
-    # -- Lifecycle ----------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        """Initialize the httpx client."""
         if self._running:
             return
         self._running = True
@@ -227,20 +296,29 @@ class AsyncDataIngestion:
             timeout=httpx.Timeout(self.HTTP_TIMEOUT_SEC),
             follow_redirects=True,
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
-            headers={"User-Agent": "JalNetra/1.0 (Water Quality Monitor)"},
+            headers={
+                "User-Agent": self._user_agent,
+                "Accept": "application/json",
+            },
         )
-        logger.info("Data ingestion service started")
+        await logger.ainfo("Data ingestion service started")
 
     async def stop(self) -> None:
+        """Close HTTP client."""
         self._running = False
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
-        logger.info("Data ingestion service stopped")
+        await logger.ainfo(
+            "Data ingestion service stopped",
+            cache_entries=len(self._cache),
+        )
 
-    # -- CPCB: Real-Time Water Quality --------------------------------------
+    # ------------------------------------------------------------------
+    # CPCB -- Water Quality from real-time monitoring
+    # ------------------------------------------------------------------
 
-    async def fetch_cpcb_water_quality(
+    async def fetch_cpcb_data(
         self,
         *,
         state: str | None = None,
@@ -248,15 +326,29 @@ class AsyncDataIngestion:
     ) -> list[WaterQualityRecord]:
         """Fetch real-time water quality data from CPCB monitoring stations.
 
-        CPCB has ~1800 stations across India providing pH, DO, BOD, COD,
-        conductivity, temperature, and coliform counts.
+        CPCB (https://cpcb.nic.in) operates ~1,800 monitoring stations across
+        India under the National Water Quality Monitoring Programme (NWMP),
+        providing pH, DO, BOD, COD, TDS, conductivity, temperature, and
+        coliform readings.
+
+        Args:
+            state: Filter by state name (e.g., "Delhi", "Rajasthan").
+            station_id: Specific CPCB station identifier.
+
+        Returns:
+            List of normalized water quality records.
         """
-        cache_key = f"cpcb:water:{state or 'all'}:{station_id or 'all'}"
-        cached = self._get_cached(cache_key)
+        cache_key = self._make_cache_key(
+            f"{self._cpcb_url}/station_list_all",
+            {"state": state or "all", "station_id": station_id or "all"},
+        )
+        cached = await self._get_cached(cache_key)
         if cached is not None:
             return cached
 
-        # CPCB CAAQMS API endpoint for water quality
+        # Rate limit
+        await self._rate_limit(_CPCB_CONFIG)
+
         url = f"{self._cpcb_url}/station_list_all"
         params: dict[str, str] = {}
         if state:
@@ -264,7 +356,7 @@ class AsyncDataIngestion:
 
         data = await self._fetch_json(url, params=params)
         if not data:
-            return self._get_cached(cache_key, ignore_ttl=True) or []
+            return await self._get_cached(cache_key, ignore_ttl=True) or []
 
         records: list[WaterQualityRecord] = []
         stations = data if isinstance(data, list) else data.get("stations", [])
@@ -272,7 +364,6 @@ class AsyncDataIngestion:
         for station in stations:
             if station_id and station.get("station_id") != station_id:
                 continue
-
             try:
                 record = WaterQualityRecord(
                     station_id=str(station.get("station_id", "")),
@@ -295,15 +386,24 @@ class AsyncDataIngestion:
                 )
                 records.append(record)
             except Exception:
-                logger.debug("Skipping malformed CPCB station record: %s", station)
+                await logger.adebug(
+                    "Skipping malformed CPCB station record",
+                    station=station,
+                )
 
-        self._set_cache(cache_key, records, self.CACHE_TTL_CPCB)
-        logger.info("Fetched %d CPCB water quality records (state=%s)", len(records), state)
+        await self._set_cache(cache_key, records, _CPCB_CONFIG.default_ttl_sec, "CPCB")
+        await logger.ainfo(
+            "Fetched CPCB water quality data",
+            records=len(records),
+            state=state,
+        )
         return records
 
-    # -- India-WRIS: Groundwater Levels ------------------------------------
+    # ------------------------------------------------------------------
+    # India-WRIS -- Groundwater levels
+    # ------------------------------------------------------------------
 
-    async def fetch_india_wris_groundwater(
+    async def fetch_india_wris_data(
         self,
         *,
         state: str | None = None,
@@ -311,13 +411,27 @@ class AsyncDataIngestion:
     ) -> list[GroundwaterRecord]:
         """Fetch groundwater level data from India-WRIS.
 
-        Provides well monitoring data: water level (meters below ground level),
-        well depth, well type, and location.
+        India-WRIS (https://indiawris.gov.in) aggregates data from CGWB
+        (Central Ground Water Board) and state groundwater departments,
+        covering ~25,000 observation wells. Provides water level (metres
+        below ground level), well depth, well type, and location.
+
+        Args:
+            state: State name filter.
+            district: District name filter.
+
+        Returns:
+            List of normalized groundwater records.
         """
-        cache_key = f"wris:gw:{state or 'all'}:{district or 'all'}"
-        cached = self._get_cached(cache_key)
+        cache_key = self._make_cache_key(
+            f"{self._wris_url}/api/groundwater/wells",
+            {"state": state or "all", "district": district or "all"},
+        )
+        cached = await self._get_cached(cache_key)
         if cached is not None:
             return cached
+
+        await self._rate_limit(_INDIA_WRIS_CONFIG)
 
         url = f"{self._wris_url}/api/groundwater/wells"
         params: dict[str, str] = {}
@@ -328,7 +442,7 @@ class AsyncDataIngestion:
 
         data = await self._fetch_json(url, params=params)
         if not data:
-            return self._get_cached(cache_key, ignore_ttl=True) or []
+            return await self._get_cached(cache_key, ignore_ttl=True) or []
 
         records: list[GroundwaterRecord] = []
         wells = data if isinstance(data, list) else data.get("wells", data.get("data", []))
@@ -354,18 +468,24 @@ class AsyncDataIngestion:
                 )
                 records.append(record)
             except Exception:
-                logger.debug("Skipping malformed WRIS well record: %s", well)
+                await logger.adebug(
+                    "Skipping malformed WRIS well record", well=well
+                )
 
-        self._set_cache(cache_key, records, self.CACHE_TTL_WRIS)
-        logger.info(
-            "Fetched %d India-WRIS groundwater records (state=%s, district=%s)",
-            len(records),
-            state,
-            district,
+        await self._set_cache(
+            cache_key, records, _INDIA_WRIS_CONFIG.default_ttl_sec, "India-WRIS"
+        )
+        await logger.ainfo(
+            "Fetched India-WRIS groundwater data",
+            records=len(records),
+            state=state,
+            district=district,
         )
         return records
 
-    # -- IMD: Weather Data -------------------------------------------------
+    # ------------------------------------------------------------------
+    # IMD -- Weather
+    # ------------------------------------------------------------------
 
     async def fetch_imd_weather(
         self,
@@ -376,15 +496,29 @@ class AsyncDataIngestion:
     ) -> list[WeatherRecord]:
         """Fetch weather data from India Meteorological Department.
 
-        Provides temperature, rainfall, humidity, wind, and pressure
-        at district-level granularity. Set ``forecast=True`` for
-        7-day forecast data instead of current observations.
+        IMD (https://mausam.imd.gov.in) provides temperature, rainfall,
+        humidity, wind, and pressure at district-level granularity from
+        ~600 surface stations. Set ``forecast=True`` for 7-day forecast
+        data instead of current observations.
+
+        Args:
+            state: Filter by state name.
+            station_id: Specific IMD station identifier.
+            forecast: If True, fetch forecast data instead of current.
+
+        Returns:
+            List of normalized weather records.
         """
         endpoint = "forecast" if forecast else "current_weather"
-        cache_key = f"imd:{endpoint}:{state or 'all'}:{station_id or 'all'}"
-        cached = self._get_cached(cache_key)
+        cache_key = self._make_cache_key(
+            f"{self._imd_url}/api/{endpoint}",
+            {"state": state or "all", "station_id": station_id or "all"},
+        )
+        cached = await self._get_cached(cache_key)
         if cached is not None:
             return cached
+
+        await self._rate_limit(_IMD_CONFIG)
 
         url = f"{self._imd_url}/api/{endpoint}"
         params: dict[str, str] = {}
@@ -395,11 +529,12 @@ class AsyncDataIngestion:
 
         data = await self._fetch_json(url, params=params)
         if not data:
-            return self._get_cached(cache_key, ignore_ttl=True) or []
+            return await self._get_cached(cache_key, ignore_ttl=True) or []
 
         records: list[WeatherRecord] = []
         observations = (
-            data if isinstance(data, list) else data.get("observations", data.get("data", []))
+            data if isinstance(data, list)
+            else data.get("observations", data.get("data", []))
         )
 
         for obs in observations:
@@ -411,18 +546,10 @@ class AsyncDataIngestion:
                     latitude=_safe_float(obs.get("latitude", obs.get("lat"))),
                     longitude=_safe_float(obs.get("longitude", obs.get("lng"))),
                     timestamp=str(obs.get("date", obs.get("timestamp", ""))),
-                    temperature_c=_safe_float(
-                        obs.get("temperature", obs.get("temp"))
-                    ),
-                    temperature_max_c=_safe_float(
-                        obs.get("temp_max", obs.get("max_temp"))
-                    ),
-                    temperature_min_c=_safe_float(
-                        obs.get("temp_min", obs.get("min_temp"))
-                    ),
-                    rainfall_mm=_safe_float(
-                        obs.get("rainfall", obs.get("rain_mm"))
-                    ),
+                    temperature_c=_safe_float(obs.get("temperature", obs.get("temp"))),
+                    temperature_max_c=_safe_float(obs.get("temp_max", obs.get("max_temp"))),
+                    temperature_min_c=_safe_float(obs.get("temp_min", obs.get("min_temp"))),
+                    rainfall_mm=_safe_float(obs.get("rainfall", obs.get("rain_mm"))),
                     humidity_pct=_safe_float(
                         obs.get("humidity", obs.get("relative_humidity"))
                     ),
@@ -430,27 +557,29 @@ class AsyncDataIngestion:
                         obs.get("wind_speed", obs.get("wind_speed_kmh"))
                     ),
                     wind_direction=str(obs.get("wind_direction", obs.get("wind_dir", ""))),
-                    pressure_hpa=_safe_float(
-                        obs.get("pressure", obs.get("slp"))
-                    ),
+                    pressure_hpa=_safe_float(obs.get("pressure", obs.get("slp"))),
                     source="IMD",
                 )
                 records.append(record)
             except Exception:
-                logger.debug("Skipping malformed IMD record: %s", obs)
+                await logger.adebug("Skipping malformed IMD record", obs=obs)
 
-        self._set_cache(cache_key, records, self.CACHE_TTL_IMD)
-        logger.info(
-            "Fetched %d IMD %s records (state=%s)",
-            len(records),
-            endpoint,
-            state,
+        await self._set_cache(
+            cache_key, records, _IMD_CONFIG.default_ttl_sec, "IMD"
+        )
+        await logger.ainfo(
+            "Fetched IMD weather data",
+            records=len(records),
+            endpoint=endpoint,
+            state=state,
         )
         return records
 
-    # -- data.gov.in: Open Datasets ----------------------------------------
+    # ------------------------------------------------------------------
+    # data.gov.in -- Open Government Data
+    # ------------------------------------------------------------------
 
-    async def fetch_data_gov(
+    async def fetch_data_gov_in(
         self,
         *,
         resource_id: str,
@@ -459,69 +588,89 @@ class AsyncDataIngestion:
         offset: int = 0,
         response_format: str = "json",
     ) -> list[dict[str, Any]]:
-        """Fetch datasets from data.gov.in Open Data API.
+        """Fetch datasets from the data.gov.in Open Data API.
+
+        data.gov.in hosts 600,000+ datasets across ministries. Relevant
+        resources for JalNetra include water quality reports, groundwater
+        assessments, rainfall records, and Jal Jeevan Mission progress data.
 
         Args:
-            resource_id: The dataset resource ID from data.gov.in
-            filters: Optional field=value filters
-            limit: Max records to fetch (API max is typically 1000)
-            offset: Pagination offset
-            response_format: One of "json", "csv", "xml"
+            resource_id: The dataset resource UUID from data.gov.in.
+            filters: Optional field=value filters.
+            limit: Max records to fetch (API max is typically 1000).
+            offset: Pagination offset.
+            response_format: One of "json", "csv", "xml".
+
+        Returns:
+            List of dataset records as dictionaries.
         """
-        cache_key = (
-            f"datagov:{resource_id}:{response_format}:"
-            f"{filters or ''}:{limit}:{offset}"
+        cache_key = self._make_cache_key(
+            f"{self._data_gov_url}/{resource_id}",
+            {
+                "format": response_format,
+                "filters": str(filters or ""),
+                "limit": str(limit),
+                "offset": str(offset),
+            },
         )
-        cached = self._get_cached(cache_key)
+        cached = await self._get_cached(cache_key)
         if cached is not None:
             return cached
+
+        await self._rate_limit(_DATA_GOV_IN_CONFIG)
 
         url = f"{self._data_gov_url}/{resource_id}"
         params: dict[str, str] = {
             "api-key": self._data_gov_key,
             "format": response_format,
-            "limit": str(limit),
+            "limit": str(min(limit, 1000)),
             "offset": str(offset),
         }
         if filters:
             for key, value in filters.items():
                 params[f"filters[{key}]"] = value
 
+        records: list[dict[str, Any]]
+
         if response_format == "json":
             data = await self._fetch_json(url, params=params)
             if not data:
-                return self._get_cached(cache_key, ignore_ttl=True) or []
+                return await self._get_cached(cache_key, ignore_ttl=True) or []
             records = data.get("records", data) if isinstance(data, dict) else data
 
         elif response_format == "csv":
             text = await self._fetch_text(url, params=params)
             if not text:
-                return self._get_cached(cache_key, ignore_ttl=True) or []
+                return await self._get_cached(cache_key, ignore_ttl=True) or []
             records = _parse_csv(text)
 
         elif response_format == "xml":
             text = await self._fetch_text(url, params=params)
             if not text:
-                return self._get_cached(cache_key, ignore_ttl=True) or []
+                return await self._get_cached(cache_key, ignore_ttl=True) or []
             records = _parse_xml_to_dicts(text, row_tag="record")
 
         else:
-            logger.error("Unsupported response format: %s", response_format)
+            await logger.aerror("Unsupported response format", format=response_format)
             return []
 
         if not isinstance(records, list):
             records = [records] if records else []
 
-        self._set_cache(cache_key, records, self.CACHE_TTL_DATA_GOV)
-        logger.info(
-            "Fetched %d records from data.gov.in (resource=%s, format=%s)",
-            len(records),
-            resource_id,
-            response_format,
+        await self._set_cache(
+            cache_key, records, _DATA_GOV_IN_CONFIG.default_ttl_sec, "data.gov.in"
+        )
+        await logger.ainfo(
+            "Fetched data.gov.in dataset",
+            records=len(records),
+            resource_id=resource_id,
+            format=response_format,
         )
         return records
 
-    # -- Convenience: fetch all sources for a region -----------------------
+    # ------------------------------------------------------------------
+    # Convenience: fetch all sources for a region
+    # ------------------------------------------------------------------
 
     async def fetch_all_for_region(
         self,
@@ -531,11 +680,12 @@ class AsyncDataIngestion:
     ) -> dict[str, Any]:
         """Concurrently fetch water quality, groundwater, and weather for a region.
 
-        Returns a dict with keys ``water_quality``, ``groundwater``, ``weather``.
+        Returns a dict with keys ``water_quality``, ``groundwater``,
+        ``weather``, and ``weather_forecast``.
         """
         tasks = {
-            "water_quality": self.fetch_cpcb_water_quality(state=state),
-            "groundwater": self.fetch_india_wris_groundwater(
+            "water_quality": self.fetch_cpcb_data(state=state),
+            "groundwater": self.fetch_india_wris_data(
                 state=state, district=district
             ),
             "weather": self.fetch_imd_weather(state=state),
@@ -548,48 +698,73 @@ class AsyncDataIngestion:
         )
         for key, result in zip(tasks.keys(), gathered):
             if isinstance(result, Exception):
-                logger.error("Failed to fetch %s for %s: %s", key, state, result)
+                await logger.aerror(
+                    "Failed to fetch data source",
+                    source=key,
+                    state=state,
+                    error=str(result),
+                )
                 results[key] = []
             else:
                 results[key] = result
 
         return results
 
-    # -- Cache management ---------------------------------------------------
+    # ------------------------------------------------------------------
+    # Cache management (async-safe)
+    # ------------------------------------------------------------------
 
-    def _get_cached(
+    async def _get_cached(
         self, key: str, *, ignore_ttl: bool = False
     ) -> Any | None:
-        entry = self._cache.get(key)
+        """Get from cache. Returns None if not found or expired."""
+        async with self._cache_lock:
+            entry = self._cache.get(key)
         if entry is None:
             return None
         if not ignore_ttl and entry.is_expired:
             return None
         if ignore_ttl and entry.is_expired:
-            logger.info(
-                "Using stale cache for %s (age: %.0fs, ttl: %.0fs) -- offline fallback",
-                key,
-                entry.age_sec,
-                entry.ttl_sec,
+            await logger.ainfo(
+                "Using stale cache (offline fallback)",
+                source=entry.source,
+                age_sec=round(entry.age_sec, 1),
+                ttl_sec=entry.ttl_sec,
             )
         return entry.data
 
-    def _set_cache(self, key: str, data: Any, ttl_sec: float) -> None:
-        self._cache[key] = CacheEntry(
-            data=data,
-            fetched_at=time.time(),
-            ttl_sec=ttl_sec,
-            source=key.split(":")[0],
-        )
+    async def _set_cache(
+        self, key: str, data: Any, ttl_sec: float, source: str
+    ) -> None:
+        """Store data in cache with TTL."""
+        async with self._cache_lock:
+            self._cache[key] = CacheEntry(
+                data=data,
+                fetched_at=time.time(),
+                ttl_sec=ttl_sec,
+                source=source,
+            )
 
-    def clear_cache(self) -> int:
-        """Clear all cached data. Returns the number of entries cleared."""
-        count = len(self._cache)
-        self._cache.clear()
-        return count
+    async def clear_cache(self, source: str | None = None) -> int:
+        """Clear cached entries, optionally filtered by source.
 
+        Returns the number of entries cleared.
+        """
+        async with self._cache_lock:
+            if source is None:
+                count = len(self._cache)
+                self._cache.clear()
+                return count
+            keys_to_remove = [
+                k for k, v in self._cache.items() if v.source == source
+            ]
+            for key in keys_to_remove:
+                del self._cache[key]
+            return len(keys_to_remove)
+
+    @property
     def cache_stats(self) -> dict[str, Any]:
-        now = time.time()
+        """Return cache statistics."""
         total = len(self._cache)
         expired = sum(1 for e in self._cache.values() if e.is_expired)
         by_source: dict[str, int] = {}
@@ -602,7 +777,25 @@ class AsyncDataIngestion:
             "by_source": by_source,
         }
 
-    # -- HTTP helpers -------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Rate limiting
+    # ------------------------------------------------------------------
+
+    async def _rate_limit(self, source_config: _SourceConfig) -> None:
+        """Ensure minimum interval between requests to a source."""
+        now = time.time()
+        last = self._last_request_at.get(source_config.name, 0.0)
+        elapsed = now - last
+
+        if elapsed < source_config.rate_limit_interval_sec:
+            wait = source_config.rate_limit_interval_sec - elapsed
+            await asyncio.sleep(wait)
+
+        self._last_request_at[source_config.name] = time.time()
+
+    # ------------------------------------------------------------------
+    # HTTP helpers with retry
+    # ------------------------------------------------------------------
 
     async def _fetch_json(
         self,
@@ -610,14 +803,14 @@ class AsyncDataIngestion:
         *,
         params: dict[str, str] | None = None,
     ) -> dict[str, Any] | list[Any] | None:
-        """Fetch JSON from a URL with retry."""
+        """Fetch JSON from a URL with retry and error handling."""
         resp = await self._http_get_with_retry(url, params=params)
         if resp is None:
             return None
         try:
             return resp.json()
         except Exception:
-            logger.warning("Failed to parse JSON response from %s", url)
+            await logger.awarning("Failed to parse JSON response", url=url)
             return None
 
     async def _fetch_text(
@@ -640,37 +833,50 @@ class AsyncDataIngestion:
     ) -> httpx.Response | None:
         """HTTP GET with exponential backoff retry."""
         if not self._http_client:
-            logger.error("HTTP client not initialized -- call start() first")
+            await logger.aerror("HTTP client not initialized -- call start() first")
             return None
 
         last_exc: Exception | None = None
-        for attempt in range(self.HTTP_MAX_RETRIES):
+        for attempt in range(1, self.HTTP_MAX_RETRIES + 1):
             try:
                 resp = await self._http_client.get(url, params=params)
                 resp.raise_for_status()
                 return resp
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
                 last_exc = exc
-                wait = min(2 ** attempt * 1.5, 60)
-                logger.warning(
-                    "GET %s attempt %d/%d failed: %s -- retrying in %.1fs",
-                    url,
-                    attempt + 1,
-                    self.HTTP_MAX_RETRIES,
-                    exc,
-                    wait,
-                )
-                await asyncio.sleep(wait)
+                if attempt < self.HTTP_MAX_RETRIES:
+                    wait = min(self.RETRY_BASE_SEC * (2 ** (attempt - 1)), 60.0)
+                    await logger.awarning(
+                        "HTTP GET failed, retrying",
+                        url=url,
+                        attempt=attempt,
+                        max_retries=self.HTTP_MAX_RETRIES,
+                        wait_sec=wait,
+                        error=str(exc),
+                    )
+                    await asyncio.sleep(wait)
 
-        logger.error(
-            "GET %s failed after %d retries: %s",
-            url,
-            self.HTTP_MAX_RETRIES,
-            last_exc,
+        await logger.aerror(
+            "HTTP GET failed after all retries",
+            url=url,
+            retries=self.HTTP_MAX_RETRIES,
+            error=str(last_exc),
         )
         return None
 
-    # -- Validation helpers -------------------------------------------------
+    # ------------------------------------------------------------------
+    # Cache key generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_cache_key(url: str, params: dict[str, str]) -> str:
+        """Generate a deterministic cache key from URL + params."""
+        raw = f"{url}|{sorted(params.items())}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+    # ------------------------------------------------------------------
+    # Validation helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def validate_water_quality(record: WaterQualityRecord) -> list[str]:
