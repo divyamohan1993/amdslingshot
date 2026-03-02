@@ -1,0 +1,60 @@
+# =============================================================================
+# JalNetra - Systemd Service Unit
+# Manages the docker-compose stack as a system service with auto-restart.
+# =============================================================================
+# Install:
+#   sudo cp jalnetra.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable jalnetra.service
+#   sudo systemctl start jalnetra.service
+# =============================================================================
+
+[Unit]
+Description=JalNetra Edge-AI Water Quality Monitoring System
+Documentation=https://github.com/your-org/jalnetra
+After=network-online.target docker.service docker.socket
+Requires=docker.service docker.socket
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/jalnetra
+
+# Environment
+Environment=COMPOSE_PROJECT_NAME=jalnetra
+EnvironmentFile=-/opt/jalnetra/.env
+
+# Start: bring up all containers
+ExecStartPre=/usr/bin/docker compose pull --quiet
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+
+# Stop: gracefully shut down containers
+ExecStop=/usr/bin/docker compose down --timeout 30
+
+# Reload: recreate containers without full restart
+ExecReload=/usr/bin/docker compose up -d --force-recreate --remove-orphans
+
+# Restart configuration
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Timeouts
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+# Security hardening
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=false
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jalnetra
+
+[Install]
+WantedBy=multi-user.target

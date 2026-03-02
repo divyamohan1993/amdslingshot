@@ -1,0 +1,161 @@
+# =============================================================================
+# JalNetra - Git Ignore
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# ---------------------------------------------------------------------------
+# Node.js / React Dashboard
+# ---------------------------------------------------------------------------
+node_modules/
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.next/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp/
+.pnp.js
+
+# ---------------------------------------------------------------------------
+# IDE and Editors
+# ---------------------------------------------------------------------------
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+.editorconfig
+
+# ---------------------------------------------------------------------------
+# Environment & Secrets
+# ---------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+.env.production
+*.pem
+*.key
+*.crt
+credentials.json
+service-account-key.json
+
+# ---------------------------------------------------------------------------
+# Machine Learning Models & Data
+# ---------------------------------------------------------------------------
+# Trained model weights (large binary files)
+models/*.onnx
+models/*.pt
+models/*.pth
+models/*.pkl
+models/*.joblib
+models/*.h5
+models/*.bin
+
+# Training data (large files)
+training/data/*.csv
+training/data/*.parquet
+training/data/*.zip
+training/data/*.gz
+training/data/*.feather
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+training/notebooks/.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Application Data (runtime)
+# ---------------------------------------------------------------------------
+data/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+backups/
+
+# ---------------------------------------------------------------------------
+# Testing & Coverage
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# ---------------------------------------------------------------------------
+# Type Checking & Linting
+# ---------------------------------------------------------------------------
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# ---------------------------------------------------------------------------
+# Terraform
+# ---------------------------------------------------------------------------
+cloud/terraform/.terraform/
+cloud/terraform/*.tfstate
+cloud/terraform/*.tfstate.backup
+cloud/terraform/.terraform.lock.hcl
+cloud/terraform/terraform.tfvars
+cloud/terraform/*.auto.tfvars
+cloud/terraform/crash.log
+
+# ---------------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------------
+*.tar
+docker-compose.override.yml
+
+# ---------------------------------------------------------------------------
+# OS Generated Files
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+
+# ---------------------------------------------------------------------------
+# Firmware (compiled binaries)
+# ---------------------------------------------------------------------------
+firmware/*.bin
+firmware/*.hex
+firmware/*.elf
+firmware/build/
