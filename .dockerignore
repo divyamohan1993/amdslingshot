@@ -1,0 +1,103 @@
+# =============================================================================
+# JalNetra - Docker Ignore
+# Excludes files from the Docker build context for faster builds.
+# =============================================================================
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.editorconfig
+
+# Documentation
+docs/
+*.md
+!requirements.txt
+LICENSE
+
+# Presentation files
+*.pptx
+*.ppt
+*.pdf
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+
+# Linting
+.ruff_cache/
+
+# Environment files (secrets should not be in the image)
+.env
+.env.local
+.env.*.local
+
+# Node artifacts (dashboard build happens in Docker)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/dist/
+
+# Terraform
+cloud/terraform/.terraform/
+cloud/terraform/*.tfstate
+cloud/terraform/*.tfstate.backup
+cloud/terraform/.terraform.lock.hcl
+
+# Deployment scripts (not needed in the image)
+deploy/
+cloud/
+
+# Training data (large files, mount as volumes instead)
+training/data/*.csv
+training/data/*.parquet
+training/data/*.zip
+
+# Jupyter notebooks checkpoints
+training/notebooks/.ipynb_checkpoints/
+
+# Backup files
+backups/
+*.bak
+*.backup
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Docker files
+docker-compose*.yml
+Dockerfile
+.dockerignore

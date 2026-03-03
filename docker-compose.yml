@@ -1,0 +1,144 @@
+# =============================================================================
+# JalNetra - Docker Compose Stack Orchestration
+# Full-stack deployment: API + Dashboard + Nginx Reverse Proxy
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # JalNetra FastAPI Application (core service)
+  # ---------------------------------------------------------------------------
+  jalnetra-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jalnetra-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - jalnetra-data:/app/data
+      - jalnetra-models:/app/models
+      - jalnetra-logs:/app/logs
+    environment:
+      - JALNETRA_ENV=${JALNETRA_ENV:-production}
+      - JALNETRA_SECRET_KEY=${JALNETRA_SECRET_KEY:-change-me-in-production}
+      - JALNETRA_DATABASE_URL=${JALNETRA_DATABASE_URL:-sqlite+aiosqlite:///app/data/jalnetra.db}
+      - JALNETRA_MODEL_DIR=/app/models
+      - JALNETRA_DATA_DIR=/app/data
+      - JALNETRA_LOG_DIR=/app/logs
+      - JALNETRA_LOG_LEVEL=${JALNETRA_LOG_LEVEL:-info}
+      - JALNETRA_CORS_ORIGINS=${JALNETRA_CORS_ORIGINS:-*}
+      - JALNETRA_API_PREFIX=${JALNETRA_API_PREFIX:-/api/v1}
+      - JALNETRA_WORKERS=${JALNETRA_WORKERS:-2}
+      - JALNETRA_MAX_SENSORS=${JALNETRA_MAX_SENSORS:-100}
+      - JALNETRA_ALERT_EMAIL=${JALNETRA_ALERT_EMAIL:-}
+      - JALNETRA_ALERT_WEBHOOK_URL=${JALNETRA_ALERT_WEBHOOK_URL:-}
+      - TZ=${TZ:-Asia/Kolkata}
+    env_file:
+      - .env
+    networks:
+      - jalnetra-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.5"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Nginx Reverse Proxy (SSL termination + static file serving)
+  # ---------------------------------------------------------------------------
+  jalnetra-nginx:
+    image: nginx:1.27-alpine
+    container_name: jalnetra-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/jalnetra.conf:/etc/nginx/conf.d/default.conf:ro
+      - jalnetra-certbot-conf:/etc/letsencrypt:ro
+      - jalnetra-certbot-www:/var/www/certbot:ro
+    depends_on:
+      jalnetra-api:
+        condition: service_healthy
+    networks:
+      - jalnetra-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Certbot (automatic SSL certificate renewal)
+  # ---------------------------------------------------------------------------
+  jalnetra-certbot:
+    image: certbot/certbot:latest
+    container_name: jalnetra-certbot
+    restart: "no"
+    volumes:
+      - jalnetra-certbot-conf:/etc/letsencrypt
+      - jalnetra-certbot-www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done;'"
+    depends_on:
+      - jalnetra-nginx
+    networks:
+      - jalnetra-network
+    profiles:
+      - ssl
+
+# ---------------------------------------------------------------------------
+# Named Volumes (persistent data)
+# ---------------------------------------------------------------------------
+volumes:
+  jalnetra-data:
+    driver: local
+    labels:
+      com.jalnetra.description: "SQLite database and application data"
+  jalnetra-models:
+    driver: local
+    labels:
+      com.jalnetra.description: "Trained ML model weights (ONNX, XGBoost)"
+  jalnetra-logs:
+    driver: local
+    labels:
+      com.jalnetra.description: "Application and access logs"
+  jalnetra-certbot-conf:
+    driver: local
+    labels:
+      com.jalnetra.description: "Let's Encrypt SSL certificates"
+  jalnetra-certbot-www:
+    driver: local
+    labels:
+      com.jalnetra.description: "Certbot webroot challenge directory"
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  jalnetra-network:
+    driver: bridge
+    name: jalnetra-network
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
